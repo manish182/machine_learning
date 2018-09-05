@@ -1,0 +1,302 @@
+import keras
+import dill
+import keras.backend as K
+from keras.engine.topology import Layer
+from keras.layers import Conv1D, Reshape, Lambda
+from keras.activations import softmax
+from keras.models import Sequential, Model
+from keras.utils import to_categorical
+from keras.layers import Input, Conv2D, Dense, Reshape
+import multiprocessing
+import tensorflow as tf
+import gensim
+from gensim.models.word2vec import Word2Vec
+from nltk.stem.lancaster import LancasterStemmer
+from nltk.tokenize import RegexpTokenizer
+import pandas as pd
+import numpy as np
+import csv
+np.random.seed(1000)
+
+use_gpu = True
+
+config = tf.ConfigProto(intra_op_parallelism_threads=multiprocessing.cpu_count(), 
+                        inter_op_parallelism_threads=multiprocessing.cpu_count(), 
+                        allow_soft_placement=True, 
+                        device_count = {'CPU' : 1, 
+                                        'GPU' : 1 if use_gpu else 0})
+
+session = tf.Session(config=config)
+K.set_session(session)
+
+dataset_location = 'dataset/Book1.csv'
+
+corpus = []
+labels = []
+flag=True
+with open(dataset_location, 'r', encoding='utf-8') as df:
+    for i, line in enumerate(df):
+        if i == 0:
+            continue
+
+        parts = line.strip().split(',')
+        labels.append(int(parts[1].strip()))
+        
+    
+        tweet = parts[3].strip()
+        if tweet.startswith('"'):
+            tweet = tweet[1:]
+        if tweet.endswith('"'):
+            tweet = tweet[:-1]
+        corpus.append(tweet.strip().lower())
+
+print('Corpus size: {}'.format(len(corpus)))
+tkr = RegexpTokenizer('[a-zA-Z0-9@]+')
+stemmer = LancasterStemmer()
+tokenized_corpus=[]
+for i, tweet in enumerate(corpus):
+    tokens = [stemmer.stem(t) for t in tkr.tokenize(tweet) if not t.startswith('@')]
+    tokenized_corpus.append(tokens)
+
+print('tokenized corpus size',len(tokenized_corpus))
+vector_size = 512
+window_size = 10
+word2vec = Word2Vec(sentences=tokenized_corpus,size=vector_size,window=window_size,negative=20,iter=50,seed=1000,workers=multiprocessing.cpu_count())
+X_vecs = word2vec.wv
+del word2vec
+del corpus
+
+train_size = 120000
+test_size = 20000
+# Compute average and max tweet length
+avg_length = 0.0
+max_length = 0
+for tweet in tokenized_corpus:
+    if len(tweet) > max_length:
+        max_length = len(tweet)
+    avg_length += float(len(tweet))
+    
+print('Average tweet length: {}'.format(avg_length / float(len(tokenized_corpus))))
+print('Max tweet length: {}'.format(max_length))
+max_tweet_length = 16
+indexes = set(np.random.choice(len(tokenized_corpus), train_size + test_size, replace=False))
+
+X_train = np.zeros((train_size, max_tweet_length, vector_size), dtype=K.floatx())
+Y_train = np.zeros((train_size, 2), dtype=np.int32)
+X_test = np.zeros((test_size, max_tweet_length, vector_size), dtype=K.floatx())
+Y_test = np.zeros((test_size, 2), dtype=np.int32)
+
+for i, index in enumerate(indexes):
+    for t, token in enumerate(tokenized_corpus[index]):
+        if t >= max_tweet_length:
+            break
+        
+        if token not in X_vecs:
+            continue
+    
+        if i < train_size:
+            X_train[i, t, :] = X_vecs[token]
+        else:
+            X_test[i - train_size, t, :] = X_vecs[token]
+            
+    if i < train_size:
+        Y_train[i, :] = [1.0, 0.0] if labels[index] == 0 else [0.0, 1.0]
+    else:
+        Y_test[i - train_size, :] = [1.0, 0.0] if labels[index] == 0 else [0.0, 1.0]
+        
+
+img_dim = (16,512)
+output_shape = 2
+
+#calculating margin loss
+def margin_loss(y_true, y_pred, 
+    m_plus=0.9, m_minus=0.1, down_weighting=0.5):
+    """
+        The margin loss defined in the paper.
+        The default parameters are those used in the paper.
+    """
+    L = y_true*K.square(K.maximum(0.0, m_plus-y_pred)) + down_weighting*(1-y_true)*K.square(K.maximum(0.0, y_pred-m_minus))
+
+    return K.mean(K.sum(L, 1))  
+
+  #squash fuction to squash the output  
+def squash(vector, epsilon=K.epsilon()):
+
+    vector += epsilon
+    norm = K.sum(K.square(vector), -1, keepdims=True)
+    scalar_factor = norm / (1 + norm) / K.sqrt(norm)
+    squashed = scalar_factor * vector
+    return squashed
+
+#makes primary capsule
+def conv2d_caps(input_layer, nb_filters, kernel_size, capsule_size, strides=2):
+
+    conv = Conv1D(
+        filters=nb_filters*capsule_size, 
+        kernel_size=kernel_size, 
+        strides=strides,
+        padding='valid'
+    )(input_layer)
+
+    conv_shape = conv.shape
+    print(conv_shape)
+    nb_capsules= int(conv_shape[1]*nb_filters)
+    print(nb_capsules)
+    capsules = Reshape(target_shape=(nb_capsules, capsule_size))(conv)
+    
+    return Lambda(squash, name='primarycap_squash')(capsules)
+
+  # sentiment capsule
+class DenseCapsule(Layer):
+
+    """
+        A fully connected capsule layer which is similar to
+        the dense layer but replace the neurons to capsules 
+    """
+
+    def __init__(self, capsule_size, nb_capsules,  kernel_initializer='glorot_uniform', iterations=5, **kwargs):
+        super(DenseCapsule, self).__init__(**kwargs)
+        self.nb_capsules = nb_capsules
+        self.iterations = iterations
+        self.capsule_size = capsule_size
+        self.initializer = kernel_initializer
+
+    def build(self, input_shape):
+        self.prev_shape = input_shape
+        self.w_ij = self.add_weight(
+            name='w_ij',
+            shape=( self.nb_capsules, input_shape[1], self.capsule_size, input_shape[2]),
+            initializer=self.initializer
+        )
+        self.built = True
+
+    def batch_dot(self, X, w, axis):
+        return K.map_fn(lambda x: K.batch_dot(x, w, axis), elems=X)
+
+    def _dynamic_routing(self, u_hat, b_ij):
+        
+        for i in range(self.iterations):
+
+            c_ij = softmax(b_ij, axis=1)
+            s_j = K.batch_dot(c_ij, u_hat, [2, 2])
+            v_j = squash(s_j)
+
+            if i < self.iterations-1:
+                b_ij +=  K.batch_dot(v_j, u_hat, [2, 3])
+                # b_ij = b_ij + K.batch_dot(K.tile(v_j,  [1, self.prev_shape[1], 1, 1, 1]), u_hat, [3, 4])
+
+        # return K.squeeze(v_j, axis=1)
+        return v_j
+
+    def call(self, inputs):
+        
+        expanded_input = K.expand_dims(inputs, 1)
+        print(expanded_input.shape)
+        expanded_input = K.tile(expanded_input, [1, self.nb_capsules, 1, 1])
+        print(expanded_input.shape)
+        u_hat = K.map_fn(lambda x: K.batch_dot(x, self.w_ij, [2, 3]), elems=expanded_input)
+        
+        b_ij = K.zeros(shape=[K.shape(u_hat)[0], self.nb_capsules, self.prev_shape[1]], dtype=np.float32)
+        
+        return self._dynamic_routing(u_hat, b_ij)
+
+    def compute_output_shape(self, input_shape):
+        return tuple([None, self.nb_capsules, self.capsule_size, 1])
+
+class CapsuleLength(Layer):
+
+    def call(self, inputs, **kwargs):
+        input_shape = inputs.get_shape().as_list()
+        x = K.reshape(inputs, shape=[-1, input_shape[1], input_shape[2]])
+        return K.sqrt(K.sum(K.square(x), -1))
+
+    def compute_output_shape(self, input_shape):
+        return input_shape[:-2]
+      
+      
+class Mask(Layer):
+    """
+        A mask layer for decoder to minimize the marginal loss.
+    """
+    def call(self, inputs):
+        
+        if type(inputs) is list:
+
+            assert len(inputs) == 2
+            inputs, mask = inputs[0], inputs[1]
+
+            assert mask.get_shape().as_list()[1] == inputs.get_shape().as_list()[1]
+        
+        else:
+            length = K.sqrt(K.sum(K.square(inputs), axis=-1))
+            mask = K.one_hot(
+                indices=K.argmax(length, 1),
+                num_classes=inputs.get_shape().as_list()[1]
+            )
+
+        mask = K.expand_dims(mask, -1)
+
+        # [None, nb_classes, 1]
+        masked = K.batch_flatten(inputs*mask)
+        return masked
+
+    def compute_output_shape(self, input_shape):
+
+        if type(input_shape[0]) is tuple:
+            return tuple([None, input_shape[0][1]])
+        else:
+            return tuple([None, input_shape[1]])
+      
+def build_models():
+    global img_dim, output_shape
+
+    input_layer = Input(shape=(img_dim[0], img_dim[1]))
+    conv1 = Conv1D(filters=256, kernel_size=3, strides=1, padding='valid', activation='relu')(input_layer)
+    print(conv1.shape)
+    primary_caps = conv2d_caps(
+        input_layer=conv1,
+        nb_filters=32,
+        kernel_size=3,
+        capsule_size=8,
+        strides=2
+    )
+    digit_caps = DenseCapsule(capsule_size=16, nb_capsules=output_shape, name='densecaps')(primary_caps)
+    output_layer = CapsuleLength(name='capsnet')(digit_caps)
+
+    # Decoder part..
+    true_labels_input = Input(shape=(output_shape,))  # use the true label to mask the capsule
+    masked_by_true_label = Mask()([digit_caps, true_labels_input])  # for training process
+    masked_by_max = Mask()(digit_caps)  # for prediction process
+
+    decoder = Sequential(name='decoder_out')
+    decoder.add(Dense(512, activation='relu', input_dim=16*output_shape))
+    decoder.add(Dense(1024, activation='relu'))
+    decoder.add(Dense(np.prod(img_dim), activation='sigmoid'))
+    decoder.add(Reshape(target_shape=img_dim))
+
+    train_decoder = decoder(masked_by_true_label)
+    eval_decoder = decoder(masked_by_max)
+
+    train_model = Model(
+        inputs=[input_layer, true_labels_input],
+        outputs=[output_layer, train_decoder]
+    )
+
+    eval_model = Model(
+        inputs=input_layer,
+        outputs=[eval_decoder, output_layer]
+    )
+
+    return train_model, eval_model  
+
+def main():
+    train_model, eval_model = build_models()
+    print(train_model.summary())
+    train_model.compile(loss=[margin_loss, 'mse'], optimizer='adam',metrics=['accuracy'])
+    train_model.fit([X_train, Y_train], [Y_train, X_train], batch_size=32, epochs=5, validation_data=[[X_test, Y_test], [Y_test, X_test]])
+    
+
+if __name__ == '__main__':
+    main()
+        
+   
